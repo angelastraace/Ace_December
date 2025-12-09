@@ -1,0 +1,168 @@
+import { NextResponse } from "next/server"
+import { createClient } from "@supabase/supabase-js"
+import {
+  xpActions,
+  getLevelFromXp,
+  getEvolutionStage,
+  getNextEvolutionStage,
+  getEvolutionProgress,
+} from "@/lib/kat-xp-service"
+
+// Initialize Supabase client
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || ""
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || ""
+const supabase = createClient(supabaseUrl, supabaseKey)
+
+export async function POST(request: Request) {
+  try {
+    const { userId, actionType, metadata } = await request.json()
+
+    if (!userId || !actionType) {
+      return NextResponse.json({ error: "Missing required fields" }, { status: 400 })
+    }
+
+    // Get the XP action
+    const action = xpActions[actionType as keyof typeof xpActions]
+
+    if (!action) {
+      return NextResponse.json({ error: "Invalid action type" }, { status: 400 })
+    }
+
+    // Get current user XP
+    const { data: userData, error: userError } = await supabase
+      .from("user_profiles")
+      .select("id, xp")
+      .eq("id", userId)
+      .single()
+
+    if (userError) {
+      return NextResponse.json({ error: "User not found" }, { status: 404 })
+    }
+
+    // Calculate new XP and level
+    const currentXp = userData.xp || 0
+    const newXp = currentXp + action.amount
+    const newLevel = getLevelFromXp(newXp)
+    const oldLevel = getLevelFromXp(currentXp)
+
+    // Check if user leveled up
+    const leveledUp = newLevel > oldLevel
+
+    // Check if evolution stage changed
+    const oldEvolutionStage = getEvolutionStage(oldLevel)
+    const newEvolutionStage = getEvolutionStage(newLevel)
+    const evolutionChanged = oldEvolutionStage.name !== newEvolutionStage.name
+
+    // Update user XP
+    const { error: updateError } = await supabase
+      .from("user_profiles")
+      .update({
+        xp: newXp,
+        level: newLevel,
+        evolution_stage: newEvolutionStage.name,
+      })
+      .eq("id", userId)
+
+    if (updateError) {
+      return NextResponse.json({ error: "Failed to update XP" }, { status: 500 })
+    }
+
+    // Log XP action
+    const { error: logError } = await supabase.from("xp_actions").insert({
+      user_id: userId,
+      action_type: actionType,
+      xp_amount: action.amount,
+      metadata: metadata || {},
+      created_at: new Date().toISOString(),
+    })
+
+    if (logError) {
+      console.error("Failed to log XP action:", logError)
+    }
+
+    // Get next evolution stage and progress
+    const nextEvolutionStage = getNextEvolutionStage(newLevel)
+    const evolutionProgress = getEvolutionProgress(newLevel)
+
+    return NextResponse.json({
+      success: true,
+      xp: {
+        previous: currentXp,
+        current: newXp,
+        gained: action.amount,
+      },
+      level: {
+        previous: oldLevel,
+        current: newLevel,
+        leveledUp,
+      },
+      evolution: {
+        previous: oldEvolutionStage.name,
+        current: newEvolutionStage.name,
+        next: nextEvolutionStage?.name || null,
+        changed: evolutionChanged,
+        progress: evolutionProgress,
+      },
+    })
+  } catch (error) {
+    console.error("Error processing XP action:", error)
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+  }
+}
+
+export async function GET(request: Request) {
+  const url = new URL(request.url)
+  const userId = url.searchParams.get("userId")
+
+  if (!userId) {
+    return NextResponse.json({ error: "Missing userId parameter" }, { status: 400 })
+  }
+
+  try {
+    // Get user XP data
+    const { data: userData, error: userError } = await supabase
+      .from("user_profiles")
+      .select("id, xp, level, evolution_stage")
+      .eq("id", userId)
+      .single()
+
+    if (userError) {
+      return NextResponse.json({ error: "User not found" }, { status: 404 })
+    }
+
+    const currentXp = userData.xp || 0
+    const currentLevel = userData.level || getLevelFromXp(currentXp)
+    const currentEvolutionStage = getEvolutionStage(currentLevel)
+    const nextEvolutionStage = getNextEvolutionStage(currentLevel)
+    const evolutionProgress = getEvolutionProgress(currentLevel)
+
+    // Get recent XP actions
+    const { data: recentActions, error: actionsError } = await supabase
+      .from("xp_actions")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(10)
+
+    if (actionsError) {
+      console.error("Failed to fetch recent actions:", actionsError)
+    }
+
+    return NextResponse.json({
+      userId,
+      xp: currentXp,
+      level: currentLevel,
+      evolution: {
+        current: currentEvolutionStage.name,
+        next: nextEvolutionStage?.name || null,
+        progress: evolutionProgress,
+        description: currentEvolutionStage.description,
+        traits: currentEvolutionStage.traits,
+      },
+      recentActions: recentActions || [],
+    })
+  } catch (error) {
+    console.error("Error fetching XP data:", error)
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 })
+  }
+}
